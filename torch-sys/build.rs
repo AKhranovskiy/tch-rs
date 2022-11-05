@@ -7,44 +7,69 @@
 // like 9.0, 90, or cu90 to specify the version of CUDA to use for libtorch.
 
 use std::env;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 const TORCH_VERSION: &str = "1.13.0";
 
-#[cfg(feature = "curl")]
+#[cfg(feature = "download-libtorch")]
 fn download<P: AsRef<Path>>(source_url: &str, target_file: P) -> anyhow::Result<()> {
-    use curl::easy::Easy;
-    use std::io::Write;
+    use anyhow::anyhow;
+    use anyhow::bail;
+    use std::io::Read;
 
-    let f = fs::File::create(&target_file)?;
-    let mut writer = io::BufWriter::new(f);
-    let mut easy = Easy::new();
-    easy.url(source_url)?;
-    easy.write_function(move |data| Ok(writer.write(data).unwrap()))?;
-    easy.perform()?;
-    let response_code = easy.response_code()?;
-    if response_code == 200 {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Unexpected response code {} for {}", response_code, source_url))
+    let resp = ureq::get(source_url).call()?;
+
+    if resp.status() != 200 {
+        bail!("Unexpected response code {} for {}", resp.status(), source_url);
     }
+
+    let len: u64 = resp
+        .header("Content-Length")
+        .ok_or_else(|| anyhow!("No Content-Length"))?
+        .parse::<u64>()?;
+
+    const CONTENT_LENGTH_LIMIT: u64 = 200 * 1_048_567; // 200 megabytes.
+    if len > CONTENT_LENGTH_LIMIT {
+        // This is rather suspicious file size, better quit.
+        bail!("File is suspiciously big, filesize={len} bytes");
+    }
+
+    let f = std::fs::File::create(&target_file)?;
+    let mut writer = std::io::BufWriter::new(f);
+    let mut reader = resp.into_reader().take(len);
+    std::io::copy(&mut reader, &mut writer)?;
+
+    Ok(())
 }
 
-#[cfg(not(feature = "curl"))]
+#[cfg(not(feature = "download-libtorch"))]
 fn download<P: AsRef<Path>>(_source_url: &str, _target_file: P) -> anyhow::Result<()> {
     anyhow::bail!("cannot use download without the curl feature")
 }
 
+#[cfg(feature = "download-libtorch")]
 fn extract<P: AsRef<Path>>(filename: P, outpath: P) -> anyhow::Result<()> {
-    let file = fs::File::open(&filename)?;
-    let buf = io::BufReader::new(file);
+    use anyhow::bail;
+
+    let file = std::fs::File::open(&filename)?;
+    let buf = std::io::BufReader::new(file);
     let mut archive = zip::ZipArchive::new(buf)?;
+
+    let total_uncompressed_size = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|file| file.size()))
+        .sum::<u64>();
+
+    const SIZE_LIMIT_1GB: u64 = 1_073_741_824;
+    if total_uncompressed_size > SIZE_LIMIT_1GB {
+        bail!("Uncompressed size is suspiciously large, size={total_uncompressed_size}");
+    }
+
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        #[allow(deprecated)]
-        let outpath = outpath.as_ref().join(file.sanitized_name());
+        let path = file
+            .enclosed_name()
+            .ok_or_else(|| anyhow::anyhow!("Suspicious filename: {}", file.name()))?;
+        let outpath = outpath.as_ref().join(path);
         if !file.name().ends_with('/') {
             println!(
                 "File {} extracted to \"{}\" ({} bytes)",
@@ -54,14 +79,19 @@ fn extract<P: AsRef<Path>>(filename: P, outpath: P) -> anyhow::Result<()> {
             );
             if let Some(p) = outpath.parent() {
                 if !p.exists() {
-                    fs::create_dir_all(p)?;
+                    std::fs::create_dir_all(p)?;
                 }
             }
-            let mut outfile = fs::File::create(&outpath)?;
-            io::copy(&mut file, &mut outfile)?;
+            let mut outfile = std::fs::File::create(&outpath)?;
+            std::io::copy(&mut file, &mut outfile)?;
         }
     }
     Ok(())
+}
+
+#[cfg(not(feature = "download-libtorch"))]
+fn extract<P: AsRef<Path>>(_filename: P, _outpath: P) -> anyhow::Result<()> {
+    anyhow::bail!("cannot use download without the zip feature")
 }
 
 fn env_var_rerun(name: &str) -> Result<String, env::VarError> {
@@ -108,7 +138,7 @@ fn prepare_libtorch_dir() -> PathBuf {
     } else {
         let libtorch_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("libtorch");
         if !libtorch_dir.exists() {
-            fs::create_dir(&libtorch_dir).unwrap_or_default();
+            std::fs::create_dir(&libtorch_dir).unwrap_or_default();
             let libtorch_url = match os.as_str() {
                 "linux" => format!(
                     "https://download.pytorch.org/libtorch/{}/libtorch-cxx11-abi-shared-with-deps-{}{}.zip",
